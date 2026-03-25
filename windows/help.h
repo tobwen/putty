@@ -46,6 +46,7 @@ typedef const char *HelpCtx;
 #define WINHELP_CTX_features_arabicshaping "config-features-shaping"
 #define WINHELP_CTX_features_bidi "config-features-bidi"
 #define WINHELP_CTX_features_bracketed_paste "config-features-bracketed-paste"
+#define WINHELP_CTX_features_osc52 "config-features-osc52"
 #define WINHELP_CTX_terminal_autowrap "config-autowrap"
 #define WINHELP_CTX_terminal_decom "config-decom"
 #define WINHELP_CTX_terminal_lfhascr "config-crlf"

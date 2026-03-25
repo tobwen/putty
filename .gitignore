@@ -13,6 +13,8 @@ cmake_install.cmake
 /shipped.txt
 *.dir/
 *.lib
+# Out-of-tree build directories (e.g. build-win64/ from cross-compilation)
+build-*/
 .dirstamp
 .deps
 .DS_Store

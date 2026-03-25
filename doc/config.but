@@ -1012,6 +1012,17 @@ to turn it off completely. If you do that, then PuTTY will always send
 your paste data exactly as if it had been typed at the keyboard,
 whether or not the server asked for bracketed paste mode.
 
+\S{config-features-osc52} Disabling remote-controlled clipboard writing (OSC 52)
+
+Terminal applications can send an \i{OSC 52} escape sequence to write data
+directly into the local clipboard.  This can be useful for copying output
+from a remote session, but it also means a compromised or untrusted
+application could silently overwrite your clipboard with malicious content
+(\q{clipboard poisoning}).
+
+By ticking this checkbox, you prevent any remote session from writing to
+your clipboard via OSC 52.
+
 \H{config-window} The Window panel
 
 The Window configuration panel allows you to control aspects of the

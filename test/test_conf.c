@@ -755,6 +755,7 @@ void test_simple(void)
     test_bool_simple(CONF_no_remote_resize, "NoRemoteResize", false);
     test_bool_simple(CONF_no_alt_screen, "NoAltScreen", false);
     test_bool_simple(CONF_no_remote_wintitle, "NoRemoteWinTitle", false);
+    test_bool_simple(CONF_no_osc52, "NoOSC52", false);
     test_bool_simple(CONF_no_remote_clearscroll, "NoRemoteClearScroll", false);
     test_bool_simple(CONF_no_dbackspace, "NoDBackspace", false);
     test_bool_simple(CONF_no_remote_charset, "NoRemoteCharset", false);

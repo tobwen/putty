@@ -189,7 +189,12 @@ struct terminal_tag {
 #define ANSI(x,y)       ((x)+((y)*256))
 #define ANSI_QUE(x)     ANSI(x,1)
 
-#define OSC_STR_MAX 2048
+/* OSC 52 needs larger payloads; other OSC strings stay small. */
+#define OSC_STR_MAX 1048576
+#define OSC_STR_MAX_OTHER 2048
+#define OSC52_B64_MAX OSC_STR_MAX
+#define OSC52_RATE_WINDOW_MS 1000
+#define OSC52_RATE_MAX_WRITES 2
     OscType osc_type;
     int osc_strlen;
     char osc_string[OSC_STR_MAX + 1];
@@ -338,6 +343,10 @@ struct terminal_tag {
     bool no_remote_charset;
     bool no_remote_resize;
     bool no_remote_wintitle;
+    bool no_osc52;
+    unsigned long osc52_window_start;
+    unsigned osc52_writes_in_window;
+    unsigned long (*get_tickcount)(struct terminal_tag *term);
     bool no_remote_clearscroll;
     bool rawcnp;
     bool utf8linedraw;

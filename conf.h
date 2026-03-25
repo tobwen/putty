@@ -584,6 +584,11 @@ CONF_OPTION(no_remote_wintitle, /* disable remote retitling */
     DEFAULT_BOOL(false),
     SAVE_KEYWORD("NoRemoteWinTitle"),
 )
+CONF_OPTION(no_osc52, /* disable OSC 52 remote clipboard write */
+    VALUE_TYPE(BOOL),
+    DEFAULT_BOOL(false),
+    SAVE_KEYWORD("NoOSC52"),
+)
 CONF_OPTION(no_remote_clearscroll, /* disable ESC[3J */
     VALUE_TYPE(BOOL),
     DEFAULT_BOOL(false),

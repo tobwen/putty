@@ -2203,6 +2203,11 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ctrl_checkbox(s, "Disable bracketed paste mode",
                   'p', HELPCTX(features_bracketed_paste), conf_checkbox_handler,
                   I(CONF_no_bracketed_paste));
+    /* NO_SHORTCUT: all single-letter shortcuts are exhausted in this panel. */
+    ctrl_checkbox(s, "Disable remote-controlled clipboard writing (OSC 52)", NO_SHORTCUT,
+                  HELPCTX(features_osc52),
+                  conf_checkbox_handler,
+                  I(CONF_no_osc52));
 
     /*
      * The Window panel.

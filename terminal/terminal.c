@@ -1607,6 +1607,8 @@ void term_seen_key_event(Terminal *term)
 void term_pwron(Terminal *term, bool clear)
 {
     power_on(term, clear);
+    term->osc52_window_start = 0;
+    term->osc52_writes_in_window = 0;
     if (term->ldisc)                   /* cause ldisc to notice changes */
         ldisc_echoedit_update(term->ldisc);
     term->disptop = 0;
@@ -1664,6 +1666,7 @@ static void term_copy_stuff_from_conf(Terminal *term)
     term->no_remote_charset = conf_get_bool(term->conf, CONF_no_remote_charset);
     term->no_remote_resize = conf_get_bool(term->conf, CONF_no_remote_resize);
     term->no_remote_wintitle = conf_get_bool(term->conf, CONF_no_remote_wintitle);
+    term->no_osc52 = conf_get_bool(term->conf, CONF_no_osc52);
     term->no_remote_clearscroll = conf_get_bool(term->conf, CONF_no_remote_clearscroll);
     term->rawcnp = conf_get_bool(term->conf, CONF_rawcnp);
     term->utf8linedraw = conf_get_bool(term->conf, CONF_utf8linedraw);
@@ -3185,6 +3188,21 @@ static void toggle_mode(Terminal *term, int mode, int query, bool state)
     }
 }
 
+static size_t osc_string_limit(Terminal *term)
+{
+    /* Keep legacy OSC limits for non-OSC52 sequences. */
+    if (term->osc_type == OSCLIKE_OSC && term->esc_args[0] == 52)
+        return OSC_STR_MAX;
+    return OSC_STR_MAX_OTHER;
+}
+
+static unsigned long term_get_tickcount(Terminal *term)
+{
+    if (term->get_tickcount)
+        return term->get_tickcount(term);
+    return GETTICKCOUNT();
+}
+
 /*
  * Process an OSC or similar sequence, with a whole embedded string,
  * like setting the window title or icon name.
@@ -3238,6 +3256,196 @@ static void do_osc(Terminal *term)
                 }
             }
             break;
+          case 52: {
+            /*
+             * OSC 52: remote clipboard write.
+             *
+             * Syntax: ESC ] 52 ; Pc ; Pd BEL  (or ST instead of BEL)
+             *   Pc = comma-separated selector list.  Accepted tokens:
+             *        '' (empty), 'c', 's' -> system/clipboard selection
+             *        'p' -> primary selection (Unix only; maps to system
+             *               clipboard on Windows which has no PRIMARY)
+             *   Pd = base64-encoded UTF-8 payload, or '?' for a query.
+             *
+             * Query replies (Pd == '?') are not implemented; the sequence
+             * is silently ignored.  A responding implementation would need
+             * to base64-encode the current clipboard content and write it
+             * back to the pty, which introduces its own security concerns
+             * and is deferred to a later version.
+             *
+             * Security risks considered:
+             *   - Clipboard poisoning: a crafted payload could embed escape
+             *     sequences that execute commands when pasted into a terminal.
+             *     Mitigated by stripping control characters (< 0x20) except
+             *     the harmless whitespace characters HT, LF, and CR.
+             *   - Data exfiltration via query: responding to '?' would leak
+             *     clipboard contents to the remote.  Mitigated by ignoring
+             *     all query payloads unconditionally.
+             *   - C1 control injection (U+0080-U+009F): filtered after UTF-8
+             *     decoding so those code points never reach the clipboard.
+             *   - Unintended use in untrusted sessions: mitigated by the
+             *     no_osc52 configuration option, which disables this handler.
+             *   - Clipboard flooding: mitigated by a per-terminal rate limit.
+             *   - Oversized payloads: mitigated by an explicit length cap.
+             */
+            if (term->no_osc52)
+                break;
+
+            char *buf = NULL;
+            strbuf *decoded = NULL;
+            wchar_t *wide = NULL;
+            size_t wlen = 0;
+
+            /* Work on a local copy so we never mutate term->osc_string. */
+            if (term->osc_strlen > OSC_STR_MAX)
+                goto out_osc52;
+            buf = snewn(term->osc_strlen + 1, char);
+            memcpy(buf, term->osc_string, term->osc_strlen + 1);
+
+            char *pc = buf;
+            char *pd = strchr(pc, ';');
+            if (!pd)
+                goto out_osc52;
+            *pd++ = '\0';
+
+            bool selection_ok = false;
+#ifdef PLATFORM_IS_UTF16
+            int clipboard = CLIP_SYSTEM;
+#else
+            int clipboard = CLIP_CLIPBOARD;
+#endif
+
+            if (!*pc) {
+                selection_ok = true;
+            } else {
+                char *p = pc;
+                while (*p) {
+                    char *token_start, *token_end;
+                    bool token_matched = false;
+
+                    while (*p == ',')
+                        p++;
+                    if (!*p)
+                        break;
+
+                    token_start = p;
+                    while (*p && *p != ',')
+                        p++;
+                    token_end = p;
+
+                    if (token_end - token_start != 1) {
+                        /* Multi-char tokens are not defined; skip. */
+                        continue;
+                    }
+
+                    char sel = *token_start;
+
+                    if (sel == 'c' || sel == 's') {
+                        token_matched = true;
+                    } else if (sel == 'p') {
+                        /*
+                         * 'p' means PRIMARY selection on Unix.  Windows
+                         * has no PRIMARY; we map it to the system clipboard
+                         * so the write still takes effect rather than being
+                         * silently dropped.
+                         */
+#ifndef PLATFORM_IS_UTF16
+                        clipboard = CLIP_PRIMARY;
+#endif
+                        token_matched = true;
+                    }
+
+                    if (token_matched) {
+                        selection_ok = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!selection_ok)
+                goto out_osc52;
+
+            /*
+             * Query payload: intentionally not implemented.  We would need
+             * to read the clipboard and write base64 data back to the pty,
+             * which is out of scope for this feature and creates a data-
+             * exfiltration path even in restricted sessions.
+             *
+             * pd is guaranteed within buf[0..OSC_STR_MAX] because strchr
+             * found the ';' separator inside buf.
+             */
+            if (pd[0] == '?' && pd[1] == '\0')
+                goto out_osc52;
+
+            ptrlen b64 = ptrlen_from_asciz(pd);
+            /* Defensive check: osc_string already bounds b64 length. */
+            if (b64.len > OSC52_B64_MAX)
+                goto out_osc52;
+            if (!base64_valid(b64))
+                goto out_osc52;
+
+            unsigned long now = term_get_tickcount(term);
+            if (now - term->osc52_window_start > OSC52_RATE_WINDOW_MS) {
+                term->osc52_window_start = now;
+                term->osc52_writes_in_window = 0;
+            }
+            if (term->osc52_writes_in_window >= OSC52_RATE_MAX_WRITES)
+                goto out_osc52;
+            term->osc52_writes_in_window++;
+
+            /* base64_decode_sb never returns NULL (safemalloc is NORETURN). */
+            decoded = base64_decode_sb(b64);
+            /* Defensive check: decoding cannot exceed 3/4 of input size. */
+            if (decoded->len > (OSC52_B64_MAX / 4) * 3)
+                goto out_osc52;
+
+            /* dup_mb_to_wc_c never returns NULL (safemalloc is NORETURN). */
+            wide = dup_mb_to_wc_c(CP_UTF8, decoded->s, decoded->len, &wlen);
+            /*
+             * Sanitize after UTF-8 decoding: strip control characters that
+             * could be interpreted as terminal escape sequences when pasted.
+             */
+            {
+                size_t r = 0, w = 0;
+                for (; r < wlen; r++) {
+                    wchar_t wc = wide[r];
+                    if (wc < 0x20 && wc != L'\t' &&
+                            wc != L'\n' && wc != L'\r')
+                        continue;
+                    if (wc == 0x7f)
+                        continue;
+                    if (wc >= 0x80 && wc <= 0x9f)
+                        continue;
+                    wide[w++] = wc;
+                }
+                wlen = w;
+                wide[wlen] = L'\0';
+            }
+            /*
+             * Invalid UTF-8 bytes are replaced or skipped by the platform
+             * conversion layer; we still write the result.  attrs and colours
+             * are NULL because we are writing plain text with no terminal
+             * attribute information.
+             *
+             * On Windows the clipboard expects a NUL-terminated wide string;
+             * dup_mb_to_wc_c returns the length excluding the NUL it appends,
+             * so we increment wlen to include it.
+             */
+#if SELECTION_NUL_TERMINATED
+            wlen++;
+#endif
+            win_clip_write(term->win, clipboard, wide, NULL, NULL,
+                           wlen, false);
+            goto out_osc52;
+          out_osc52:
+            if (wide)
+                sfree(wide);
+            if (decoded)
+                strbuf_free(decoded);
+            if (buf)
+                sfree(buf);
+            break;
+          }
         }
         break;
       default:
@@ -5390,7 +5598,7 @@ static void term_out(Terminal *term, bool called_from_term_data)
                 }
 
                 /* Anything else gets added to the string */
-                if (term->osc_strlen < OSC_STR_MAX)
+                if (term->osc_strlen < osc_string_limit(term))
                     term->osc_string[term->osc_strlen++] = (char)c;
                 break;
               case OSC_MAYBE_ST_UTF8:
@@ -5405,9 +5613,9 @@ static void term_out(Terminal *term, bool called_from_term_data)
                 /* No, so append the pending C2 byte to the OSC string
                  * followed by the current character, and go back to
                  * OSC string accumulation */
-                if (term->osc_strlen < OSC_STR_MAX)
+                if (term->osc_strlen < osc_string_limit(term))
                     term->osc_string[term->osc_strlen++] = 0xC2;
-                if (term->osc_strlen < OSC_STR_MAX)
+                if (term->osc_strlen < osc_string_limit(term))
                     term->osc_string[term->osc_strlen++] = (char)c;
                 term->termstate = OSC_STRING;
                 break;

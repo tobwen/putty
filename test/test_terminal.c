@@ -37,8 +37,22 @@ typedef struct Mock {
 
     bool any_test_failed;
 
+    /*
+     * clipboard_text stores the most recent OSC 52 payload written via
+     * mock_clip_write, re-encoded as UTF-8 for easy comparison.
+     * clipboard_id records which clipboard was targeted.
+     */
+    strbuf *clipboard_text;
+    int    clipboard_id;
+
     TermWin tw;
 } Mock;
+
+static unsigned long mock_ticks;
+static unsigned long mock_tickcount(Terminal *term)
+{
+    return mock_ticks;
+}
 
 static bool mock_setup_draw_ctx(TermWin *win) { return false; }
 static void mock_draw_text(TermWin *win, int x, int y, wchar_t *text, int len,
@@ -54,6 +68,42 @@ static void mock_palette_get_overrides(TermWin *tw, Terminal *term) {}
 static void mock_set_title(TermWin *win, const char *title, int codepage);
 static void mock_set_icon_title(TermWin *win, const char *title, int cp) {}
 
+static void mock_clip_write(TermWin *win, int clipboard, wchar_t *text,
+                            int *attrs, truecolour *colours, int len,
+                            bool deselect)
+{
+    Mock *mk = container_of(win, Mock, tw);
+    strbuf_clear(mk->clipboard_text);
+    mk->clipboard_id = clipboard;
+    /*
+     * Re-encode the wide string to UTF-8 so tests can compare against plain
+     * string literals.  The bit masks below are standard UTF-8 encoding as
+     * per RFC 3629: continuation bytes use 0x80 marker + 6 data bits (0x3F
+     * mask); lead bytes use 0xC0/0xE0/0xF0 for 2/3/4-byte sequences.
+     */
+    for (int i = 0; i < len; i++) {
+        unsigned long wc = text[i];
+        if (wc == 0) break;  /* skip NUL terminator on SELECTION_NUL_TERMINATED platforms */
+        if (wc < 0x80) {
+            put_byte(mk->clipboard_text, (unsigned char)wc);
+        } else if (wc < 0x800) {
+            put_byte(mk->clipboard_text, 0xC0 | (wc >> 6));
+            put_byte(mk->clipboard_text, 0x80 | (wc & 0x3F));
+        } else if (wc < 0x10000) {
+            put_byte(mk->clipboard_text, 0xE0 | (wc >> 12));
+            put_byte(mk->clipboard_text, 0x80 | ((wc >> 6) & 0x3F));
+            put_byte(mk->clipboard_text, 0x80 | (wc & 0x3F));
+        } else {
+            put_byte(mk->clipboard_text, 0xF0 | (wc >> 18));
+            put_byte(mk->clipboard_text, 0x80 | ((wc >> 12) & 0x3F));
+            put_byte(mk->clipboard_text, 0x80 | ((wc >> 6) & 0x3F));
+            put_byte(mk->clipboard_text, 0x80 | (wc & 0x3F));
+        }
+    }
+}
+
+static void mock_clip_request_paste(TermWin *win, int clipboard) {}
+
 static const TermWinVtable mock_termwin_vt = {
     .setup_draw_ctx = mock_setup_draw_ctx,
     .draw_text = mock_draw_text,
@@ -64,6 +114,8 @@ static const TermWinVtable mock_termwin_vt = {
     .set_raw_mouse_mode_pointer = mock_set_raw_mouse_mode_pointer,
     .palette_set = mock_palette_set,
     .palette_get_overrides = mock_palette_get_overrides,
+    .clip_write = mock_clip_write,
+    .clip_request_paste = mock_clip_request_paste,
 };
 
 static Mock *mock_new(void)
@@ -79,6 +131,8 @@ static Mock *mock_new(void)
 
     mk->context = strbuf_new();
     mk->title = strbuf_new();
+    mk->clipboard_text = strbuf_new();
+    mk->clipboard_id = -1;
 
     mk->tw.vt = &mock_termwin_vt;
 
@@ -91,6 +145,7 @@ static void mock_free(Mock *mk)
     conf_free(mk->conf);
     term_free(mk->term);
     strbuf_free(mk->title);
+    strbuf_free(mk->clipboard_text);
     sfree(mk);
 }
 
@@ -108,6 +163,8 @@ static void reset(Mock *mk)
     term_set_trust_status(mk->term, false);
     strbuf_clear(mk->context);
     strbuf_clear(mk->title);
+    strbuf_clear(mk->clipboard_text);
+    mk->clipboard_id = -1;
 }
 
 #if 0
@@ -524,6 +581,227 @@ static void test_wintitle(Mock *mk)
     SEQUAL(mk->title->s, "bar");
 }
 
+/*
+ * base64("hello") = "aGVsbG8="
+ * base64("world") = "d29ybGQ="
+ * base64("a\x01b") = "YQFi"  (contains ASCII control char 0x01)
+ * base64("a\tb")   = "YQli"  (tab, which we keep)
+ */
+static void test_osc52(Mock *mk)
+{
+    /* --- Happy path: empty selector routes to default clipboard --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;aGVsbG8=\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "hello");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    /* --- Empty payload clears clipboard --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    /* --- 'c' selector routes to CLIP_CLIPBOARD, ST terminator --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;c;d29ybGQ=\033\\"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "world");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    /* --- 's' selector behaves like 'c' (also CLIP_CLIPBOARD) --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;s;aGVsbG8=\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "hello");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    /* --- 'p' selector routes to CLIP_PRIMARY on Unix --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;p;aGVsbG8=\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "hello");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_PRIMARY);
+#endif
+
+    /* --- Comma-separated: first valid token 'c' wins --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;x,c,s;aGVsbG8=\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "hello");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    /* --- Query payload '?' silently ignored; clipboard_id stays -1 --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;?\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "");
+    IEQUAL(mk->clipboard_id, -1);
+
+    /* --- Invalid base64 payload ignored; clipboard_id stays -1 --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;not!base64\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "");
+    IEQUAL(mk->clipboard_id, -1);
+
+    /* --- Max-size payload accepted (clipboard_id is set) --- */
+    reset(mk);
+    {
+        strbuf *payload = strbuf_new();
+        strbuf *seq = strbuf_new();
+        for (size_t i = 0; i < OSC52_B64_MAX; i++)
+            put_byte(payload, 'A');
+        put_fmt(seq, "\033]52;;%s\007", payload->s);
+        term_datapl(mk->term, ptrlen_from_strbuf(seq));
+        term_update(mk->term);
+#ifdef PLATFORM_IS_UTF16
+        IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+        IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+        strbuf_free(seq);
+        strbuf_free(payload);
+    }
+
+    /* --- Missing ';' separator ignored; clipboard_id stays -1 --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;aGVsbG8=\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "");
+    IEQUAL(mk->clipboard_id, -1);
+
+    /* --- Unknown-only selectors ignored; clipboard_id stays -1 --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;z;aGVsbG8=\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "");
+    IEQUAL(mk->clipboard_id, -1);
+
+    /* --- Sanitization: control char 0x01 stripped, tab preserved --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;YQFi\007")); /* "a\x01b" */
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "ab");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;YQli\007")); /* "a\tb" */
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "a\tb");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    /* --- Sanitization: DEL and C1 controls stripped --- */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;YX9i\007")); /* "a\x7fb" */
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "ab");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;YcKbYg==\007")); /* "a\u009bb" */
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "ab");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    /* --- Sanitization: newlines must be preserved (multi-line copy) ---
+     * base64("line1\nline2") = "bGluZTEKbGluZTI="
+     */
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;bGluZTEKbGluZTI=\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "line1\nline2");
+#ifdef PLATFORM_IS_UTF16
+    IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+    IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+
+    /* --- Rate limit: only first N writes in window are accepted --- */
+    reset(mk);
+    {
+        static const char *const b64s[] = {
+            "YQ==", "Yg==", "Yw==", "ZA==", "ZQ==", "Zg=="
+        };
+        static const char *const dec[] = {
+            "a", "b", "c", "d", "e", "f"
+        };
+        strbuf *seq = strbuf_new();
+        size_t count = OSC52_RATE_MAX_WRITES + 1;
+        mk->term->get_tickcount = mock_tickcount;
+        mock_ticks = 1000;
+        mk->term->osc52_window_start = mock_ticks;
+        mk->term->osc52_writes_in_window = 0;
+        for (size_t i = 0; i < count; i++) {
+            strbuf_clear(seq);
+            put_fmt(seq, "\033]52;;%s\007", b64s[i]);
+            term_datapl(mk->term, ptrlen_from_strbuf(seq));
+            term_update(mk->term);
+        }
+        SEQUAL(mk->clipboard_text->s, dec[OSC52_RATE_MAX_WRITES - 1]);
+#ifdef PLATFORM_IS_UTF16
+        IEQUAL(mk->clipboard_id, CLIP_SYSTEM);
+#else
+        IEQUAL(mk->clipboard_id, CLIP_CLIPBOARD);
+#endif
+        mk->term->get_tickcount = NULL;
+        strbuf_free(seq);
+    }
+
+    /* --- no_osc52=true suppresses all writes; clipboard_id stays -1 --- */
+    reset(mk);
+    conf_set_bool(mk->conf, CONF_no_osc52, true);
+    term_reconfig(mk->term, mk->conf);
+    term_datapl(mk->term, PTRLEN_LITERAL("\033]52;;aGVsbG8=\007"));
+    term_update(mk->term);
+    SEQUAL(mk->clipboard_text->s, "");
+    IEQUAL(mk->clipboard_id, -1);
+
+    /* Restore default for subsequent tests. */
+    conf_set_bool(mk->conf, CONF_no_osc52, false);
+    term_reconfig(mk->term, mk->conf);
+}
+
 int main(void)
 {
     Mock *mk = mock_new();
@@ -533,6 +811,7 @@ int main(void)
     test_wrap(mk);
     test_nonwrap(mk);
     test_wintitle(mk);
+    test_osc52(mk);
 
     bool failed = mk->any_test_failed;
     mock_free(mk);
